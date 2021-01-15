@@ -3,7 +3,7 @@
 import Neo4j from 'neo4j-driver';
 import * as vis from 'vis-network/standalone';
 import { defaults } from './defaults';
-import { ClickEdgeEvent, ClickNodeEvent, CompletionEvent, ErrorEvent, EventController } from './events';
+import { EventController, CompletionEvent, ClickEdgeEvent, DoubleClickEdgeEvent, ClickNodeEvent, DoubleClickNodeEvent, ErrorEvent } from './events';
 
 export const NEOVIS_DEFAULT_CONFIG = Symbol();
 export const NEOVIS_ADVANCED_CONFIG = Symbol();
@@ -14,6 +14,7 @@ export default class NeoVis {
 	_data = {};
 	_network = null;
 	_events = new EventController();
+	_rightClickHandlers = {};
 
 	/**
 	 * Get current vis nodes from the graph
@@ -100,6 +101,76 @@ export default class NeoVis {
 		this._database = config.server_database;
 		this._query = config.initial_cypher || defaults.neo4j.initialQuery;
 		this._container = document.getElementById(config.container_id);
+		let eventHandlers = {
+			[ClickNodeEvent]: [],
+			[ClickEdgeEvent]: [],
+			[DoubleClickNodeEvent]: [],
+			[DoubleClickEdgeEvent]: [],
+		};
+		let RightClickHandlers = {};
+		if (config.labels) {
+			for (let key of Object.keys(config.labels)) {
+				const onClickFunc = config.labels[key].click;
+				if (onClickFunc) {
+					if (typeof onClickFunc === 'function') {
+						eventHandlers[ClickNodeEvent].push((values) => {
+							if (values && typeof values === 'object' && values.node && values.node._neo4jLabel === key) {
+								onClickFunc(values);
+							}
+						});
+					}
+				}
+				const onDoubleClickFunc = config.labels[key].doubleClick;
+				if (onDoubleClickFunc) {
+					if (typeof onDoubleClickFunc === 'function') {
+						eventHandlers[DoubleClickNodeEvent].push((values) => {
+							if (values && typeof values === 'object' && values.node && values.node._neo4jLabel === key) {
+								onDoubleClickFunc(values);
+							}
+						});
+					}
+				}
+
+				const onRightClickConfig = config.labels[key].rightClick;
+				if (onRightClickConfig) {
+					if (typeof onRightClickConfig === 'object') {
+						let nameList = [];
+						let nameHandlers = {};
+						for (let operationName of Object.keys(onRightClickConfig)) {
+							nameList.push(operationName);
+							nameHandlers[operationName] = onRightClickConfig[operationName];
+						}
+						RightClickHandlers[key] = [nameList, nameHandlers];
+					}
+				}
+			}
+		}
+		if (config.relationships) {
+			for (let key of Object.keys(config.relationships)) {
+				const onClickFunc = config.relationships[key].click;
+				if (onClickFunc) {
+					if (typeof onClickFunc === 'function') {
+						eventHandlers[ClickEdgeEvent].push((values) => {
+							if (values && typeof values === 'object' && values.edge && values.edge._neo4jLabel === key) {
+								onClickFunc(values);
+							}
+						});
+					}
+				}
+				const onDoubleClickFunc = config.relationships[key].doubleClick;
+				if (onDoubleClickFunc) {
+					if (typeof onDoubleClickFunc === 'function') {
+						eventHandlers[DoubleClickEdgeEvent].push((values) => {
+							if (values && typeof values === 'object' && values.edge && values.edge._neo4jLabel === key) {
+								onDoubleClickFunc(values);
+							}
+						});
+					}
+				}
+			}
+		}
+		this._events = new EventController(eventHandlers);
+		this._rightClickHandlers = RightClickHandlers;
 	}
 
 	_addNode(node) {
@@ -450,19 +521,116 @@ export default class NeoVis {
 					let neoVis = this;
 					this._network.on('click', function (params) {
 						if (params.nodes.length > 0) {
-							let nodeId = this.getNodeAt(params.pointer.DOM);
-							neoVis._events.generateEvent(ClickNodeEvent, {
-								nodeId: nodeId,
-								node: neoVis._nodes[nodeId]
+							params.nodes.forEach((nodeId) => {
+								neoVis._events.generateEvent(ClickNodeEvent, { nodeId: nodeId, node: neoVis._nodes[nodeId] });
 							});
 						} else if (params.edges.length > 0) {
-							let edgeId = this.getEdgeAt(params.pointer.DOM);
-							neoVis._events.generateEvent(ClickEdgeEvent, {
-								edgeId: edgeId,
-								edge: neoVis._edges[edgeId]
+							params.edges.forEach((edgeId) => {
+								neoVis._events.generateEvent(ClickEdgeEvent, { edgeId: edgeId, edge: neoVis._edges[edgeId] });
 							});
 						}
 					});
+
+					this._network.on('doubleClick', function (params) {
+						if (params.nodes.length > 0) {
+							params.nodes.forEach((nodeId) => {
+								neoVis._events.generateEvent(DoubleClickNodeEvent, { nodeId: nodeId, node: neoVis._nodes[nodeId] });
+							});
+						} else if (params.edges.length > 0) {
+							params.edges.forEach((edgeId) => {
+								neoVis._events.generateEvent(DoubleClickEdgeEvent, { edgeId: edgeId, edge: neoVis._edges[edgeId] });
+							});
+						}
+					});
+					this.registerRightClickEvent();
+				},
+				onError: (error) => {
+					this._consoleLog(error, 'error');
+					this._events.generateEvent(ErrorEvent, { error_msg: error });
+				}
+			});
+	}
+
+	remove(query) {
+
+		// connect to Neo4j instance
+		// run query
+		let recordCount = 0;
+		const _query = query || this._query;
+		let session = this._driver.session(this._database && { database: this._database });
+		const dataBuildPromises = [];
+		let nodesToRemove = {};
+		let edgesToRemove = {};
+		session
+			.run(_query, { limit: 30 })
+			.subscribe({
+				onNext: (record) => {
+					recordCount++;
+
+					this._consoleLog('CLASS NAME');
+					this._consoleLog(record && record.constructor.name);
+					this._consoleLog(record);
+
+					const dataPromises = Object.values(record.toObject()).map(async (v) => {
+						this._consoleLog('Constructor:');
+						this._consoleLog(v && v.constructor.name);
+						if (v instanceof Neo4j.types.Node) {
+							let nodeID = v.identity.toInt();
+							this._removeNodeByID(nodeID, nodesToRemove);
+
+						} else if (v instanceof Neo4j.types.Relationship) {
+							let edgeID = v.identity.toInt();
+							this._removeEdgeByID(edgeID, edgesToRemove);
+
+						} else if (v instanceof Neo4j.types.Path) {
+							this._consoleLog('PATH');
+							this._consoleLog(v);
+							let startNodeID = v.start.identity.toInt();
+							let endNodeID = v.end.identity.toInt();
+
+							this._removeNodeByID(startNodeID, nodesToRemove);
+							this._removeNodeByID(endNodeID, nodesToRemove);
+
+							for (let obj of v.segments) {
+								this._removeNodeByID(obj.start.identity.toInt(), nodesToRemove);
+								this._removeNodeByID(obj.end.identity.toInt(), nodesToRemove);
+								this._removeEdgeByID(obj.relationship.identity.toInt(), edgesToRemove);
+							}
+
+						} else if (v instanceof Array) {
+							for (let obj of v) {
+								this._consoleLog('Array element constructor:');
+								this._consoleLog(obj && obj.constructor.name);
+								if (obj instanceof Neo4j.types.Node) {
+									let nodeID = obj.identity.toInt();
+									this._removeNodeByID(nodeID, nodesToRemove);
+
+								} else if (obj instanceof Neo4j.types.Relationship) {
+									let edgeID = obj.identity.toInt();
+
+									this._removeEdgeByID(edgeID, edgesToRemove);
+								}
+							}
+						}
+					});
+					dataBuildPromises.push(Promise.all(dataPromises));
+				},
+				onCompleted: async () => {
+					await Promise.all(dataBuildPromises);
+					session.close();
+
+					if(this._network && this._network.body.data.nodes.length > 0) {
+						this._data.nodes.remove(Object.values(nodesToRemove));
+						this._data.edges.remove(Object.values(edgesToRemove));
+					}
+					this._consoleLog('completed');
+					setTimeout(
+						() => {
+							this._network.stopSimulation();
+						},
+						10000
+					);
+					this._events.generateEvent(CompletionEvent, { record_count: recordCount });
 				},
 				onError: (error) => {
 					this._consoleLog(error, 'error');
@@ -538,6 +706,10 @@ export default class NeoVis {
 		this.render(query);
 	}
 
+	removeWithCypher(query) {
+		this.remove(query);
+	}
+
 	nodeToHtml(neo4jNode, title_properties) {
 		let title = '';
 		if (!title_properties) {
@@ -551,4 +723,50 @@ export default class NeoVis {
 		}
 		return title;
 	}
+
+	registerRightClickEvent() {
+		let neovis = this;
+		this._network.off('oncontext');
+		this._network.on('oncontext', function (params) {
+			$(document).off('mousedown');
+			params.event.preventDefault();
+			$('.custom-menu').finish().toggle(100);
+			$('.custom-menu').css({
+				top: params.event.pageY + 'px',
+				left: params.event.pageX + 'px'
+			});
+			const selectedNodeID = neovis._network.getNodeAt(params.pointer.DOM);
+			if (selectedNodeID) {
+				const node = neovis._nodes[selectedNodeID];
+				const label = node._neo4jLabel;
+				$('.custom-menu').empty();
+				for (let item in neovis._rightClickHandlers[label][0]) {
+					const name = neovis._rightClickHandlers[label][0][item];
+					$('.custom-menu').append(`<li data-action="${name}">${name}</li>`);
+				}
+			}
+			// If the menu element is clicked
+			$('.custom-menu li').click(function(){
+				// This is the triggered action name
+				const selectedOperation = $(this).attr('data-action');
+				const node = neovis._nodes[selectedNodeID];
+				const label = node._neo4jLabel;
+				const operationFunc = neovis._rightClickHandlers[label][1][selectedOperation];
+				if (typeof operationFunc === 'function') {
+					operationFunc(node);
+				}
+
+				// Hide it AFTER the action was triggered
+				$('.custom-menu').hide(100);
+			});
+			$(document).bind('mousedown', function (e) {
+				// If the clicked element is not the menu
+				if (!$(e.target).parents('.custom-menu').length > 0) {
+					// Hide it
+					$('.custom-menu').hide(100);
+				}
+			});
+		});
+	}
+
 }
